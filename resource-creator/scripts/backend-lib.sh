@@ -267,6 +267,7 @@ wait_for_kube_api() {
   return 1
 }
 
+
 ensure_eks_public_api_access() {
   local cluster_name="$1"
   local region="$2"
@@ -316,4 +317,650 @@ resolve_kube_context() {
   fi
 
   return 1
+}
+
+delete_kubernetes_lb_resources() {
+  local cluster_name="$1"
+  local region="$2"
+
+  echo "Attempting to delete Kubernetes LoadBalancer services and Ingresses for cluster: ${cluster_name}..."
+  
+  # Update kubeconfig to ensure we can talk to the cluster if it's still alive or deleting
+  local status
+  status="$(aws eks describe-cluster --name "$cluster_name" --region "$region" --query 'cluster.status' --output text 2>/dev/null || echo "UNKNOWN")"
+  
+  if [[ "$status" == "ACTIVE" || "$status" == "DELETING" ]]; then
+    aws eks update-kubeconfig --name "$cluster_name" --region "$region" >/dev/null 2>&1 || true
+    local context
+    context="$(resolve_kube_context "$cluster_name" || true)"
+    if [[ -n "$context" ]]; then
+      echo "Deleting Services of type LoadBalancer..."
+      kubectl --context "$context" get svc -A -o json | jq -r '.items[] | select(.spec.type=="LoadBalancer") | [.metadata.namespace, .metadata.name] | @tsv' | while read -r ns name; do
+        kubectl --context "$context" delete svc "$name" -n "$ns" --timeout=30s --wait=false || true
+      done
+
+      echo "Deleting Ingresses..."
+      kubectl --context "$context" delete ingress -A --all --timeout=30s --wait=false || true
+      
+      # Wait a bit for controllers to clean up
+      sleep 10
+    fi
+  else
+    echo "Cluster status is ${status}, skipping Kubernetes-level cleanup."
+  fi
+}
+
+cleanup_eks_addons_cli() {
+  local cluster_name="$1"
+  local region="$2"
+
+  echo "Proactively deleting EKS addons via CLI for cluster: ${cluster_name}..."
+  
+  local addons
+  addons="$(aws eks list-addons --cluster-name "$cluster_name" --region "$region" --query 'addons' --output text 2>/dev/null || true)"
+  
+  for addon in $addons; do
+    echo "Deleting EKS addon: ${addon}"
+    aws eks delete-addon --cluster-name "$cluster_name" --addon-name "$addon" --region "$region" --preserve=false >/dev/null 2>&1 || true
+  done
+
+  if [[ -n "$addons" ]]; then
+    echo "Waiting for addons to initiate deletion..."
+    sleep 10
+  fi
+}
+
+cleanup_eks_nodegroups_cli() {
+  local cluster_name="$1"
+  local region="$2"
+
+  echo "Deleting EKS node groups via CLI for cluster: ${cluster_name}..."
+  local nodegroups
+  nodegroups="$(aws eks list-nodegroups --cluster-name "$cluster_name" --region "$region" \
+    --query 'nodegroups' --output text 2>/dev/null || true)"
+
+  for ng in $nodegroups; do
+    echo "Deleting node group: ${ng}"
+    aws eks delete-nodegroup --cluster-name "$cluster_name" --nodegroup-name "$ng" --region "$region" >/dev/null 2>&1 || true
+  done
+
+  if [[ -n "$nodegroups" ]]; then
+    echo "Waiting for node groups to be deleted (this can take 5-10 minutes)..."
+    for ng in $nodegroups; do
+      local i
+      for i in {1..40}; do
+        local ng_status
+        ng_status="$(aws eks describe-nodegroup --cluster-name "$cluster_name" --nodegroup-name "$ng" --region "$region" \
+          --query 'nodegroup.status' --output text 2>/dev/null || echo "GONE")"
+        if [[ "$ng_status" == "GONE" ]]; then
+          echo "Node group ${ng} deleted."
+          break
+        fi
+        echo "Node group ${ng} status: ${ng_status} (Attempt $i/40)..."
+        sleep 15
+      done
+    done
+  fi
+}
+
+cleanup_eks_aws_resources() {
+  local cluster_name="$1"
+  local region="$2"
+
+  echo "Starting NUCLEAR cleanup of AWS resources for cluster: ${cluster_name} in ${region}..."
+
+  # 1. Find VPC ID — try multiple tag patterns
+  local vpc_id base_pattern
+  base_pattern="${cluster_name%-[a-z]*-eks}"
+  vpc_id="$(aws ec2 describe-vpcs --region "$region" \
+    --filters "Name=tag:Name,Values=*${base_pattern}*" \
+    --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "None")"
+
+  if [[ -z "$vpc_id" || "$vpc_id" == "None" ]]; then
+    vpc_id="$(aws ec2 describe-vpcs --region "$region" \
+      --filters "Name=tag:kubernetes.io/cluster/${cluster_name},Values=shared,owned" \
+      --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "None")"
+  fi
+
+  if [[ -z "$vpc_id" || "$vpc_id" == "None" ]]; then
+    echo "Could not resolve VPC ID for cleanup, skipping AWS CLI force cleanup."
+    return 0
+  fi
+  echo "Target VPC for cleanup: ${vpc_id}"
+
+  # 2. Delete EKS node groups via CLI (they hold ENIs in subnets)
+  cleanup_eks_nodegroups_cli "$cluster_name" "$region" || true
+
+  # 3. Cleanup NAT Gateways — capture EIP allocations BEFORE deletion
+  echo "Checking for NAT Gateways..."
+  local nat_gw_ids nat_eip_allocs
+  nat_gw_ids="$(aws ec2 describe-nat-gateways --region "$region" \
+    --filter "Name=vpc-id,Values=${vpc_id}" \
+    --query 'NatGateways[?State!=`deleted`].NatGatewayId' --output text)"
+
+  nat_eip_allocs=""
+  for ngw in $nat_gw_ids; do
+    local eips
+    eips="$(aws ec2 describe-nat-gateways --region "$region" --nat-gateway-ids "$ngw" \
+      --query 'NatGateways[0].NatGatewayAddresses[*].AllocationId' --output text 2>/dev/null || true)"
+    nat_eip_allocs="${nat_eip_allocs} ${eips}"
+    echo "Deleting NAT Gateway: ${ngw} (EIPs: ${eips:-none})"
+    aws ec2 delete-nat-gateway --region "$region" --nat-gateway-id "$ngw" || true
+  done
+
+  # Also collect EIP allocs from NAT GWs already in "deleting" state (from prior failed runs)
+  local deleting_ngw_eips
+  deleting_ngw_eips="$(aws ec2 describe-nat-gateways --region "$region" \
+    --filter "Name=vpc-id,Values=${vpc_id}" \
+    --query 'NatGateways[?State==`deleting`].NatGatewayAddresses[*].AllocationId' --output text 2>/dev/null || true)"
+  nat_eip_allocs="${nat_eip_allocs} ${deleting_ngw_eips}"
+
+  if [[ -n "$nat_gw_ids" ]]; then
+    echo "Waiting for NAT Gateways to reach DELETED state..."
+    local i
+    for i in {1..30}; do
+      local remaining
+      remaining="$(aws ec2 describe-nat-gateways --region "$region" \
+        --filter "Name=vpc-id,Values=${vpc_id}" \
+        --query 'NatGateways[?State!=`deleted`].NatGatewayId' --output text)"
+      if [[ -z "$remaining" ]]; then
+        echo "All NAT Gateways deleted."
+        break
+      fi
+      echo "Still waiting for NAT Gateways: ${remaining} (Attempt $i/30)..."
+      sleep 20
+    done
+  fi
+
+  # Release NAT GW EIPs
+  for alloc in $nat_eip_allocs; do
+    [[ -z "$alloc" || "$alloc" == "None" ]] && continue
+    echo "Releasing NAT Gateway EIP allocation: ${alloc}"
+    aws ec2 release-address --region "$region" --allocation-id "$alloc" 2>/dev/null || true
+  done
+
+  # 4. Cleanup Load Balancers (ELB v2 - NLB/ALB)
+  echo "Checking for orphaned ELB v2..."
+  local elbv2_arns
+  elbv2_arns="$(aws elbv2 describe-load-balancers --region "$region" \
+    --query "LoadBalancers[?VpcId=='${vpc_id}'].LoadBalancerArn" --output text)"
+  for arn in $elbv2_arns; do
+    echo "Deleting ELB v2: ${arn}"
+    aws elbv2 delete-load-balancer --region "$region" --load-balancer-arn "$arn" || true
+  done
+
+  # 5. Cleanup Classic Load Balancers
+  echo "Checking for orphaned Classic ELBs..."
+  local elb_names
+  elb_names="$(aws elb describe-load-balancers --region "$region" \
+    --query "LoadBalancerDescriptions[?VpcId=='${vpc_id}'].LoadBalancerName" --output text)"
+  for name in $elb_names; do
+    echo "Deleting Classic ELB: ${name}"
+    aws elb delete-load-balancer --region "$region" --load-balancer-name "$name" || true
+  done
+
+  if [[ -n "$elbv2_arns" || -n "$elb_names" ]]; then
+    echo "Waiting for load balancers to be deleted..."
+    sleep 30
+  fi
+
+  # 6. Cleanup Target Groups
+  echo "Checking for orphaned Target Groups..."
+  local tg_arns
+  tg_arns="$(aws elbv2 describe-target-groups --region "$region" \
+    --query "TargetGroups[?VpcId=='${vpc_id}'].TargetGroupArn" --output text)"
+  for arn in $tg_arns; do
+    echo "Deleting Target Group: ${arn}"
+    aws elbv2 delete-target-group --region "$region" --target-group-arn "$arn" || true
+  done
+
+  # 7. Cleanup VPC Endpoints
+  echo "Checking for VPC Endpoints..."
+  local vpce_ids
+  vpce_ids="$(aws ec2 describe-vpc-endpoints --region "$region" \
+    --filters "Name=vpc-id,Values=${vpc_id}" \
+    --query 'VpcEndpoints[*].VpcEndpointId' --output text)"
+  for vpce in $vpce_ids; do
+    echo "Deleting VPC Endpoint: ${vpce}"
+    aws ec2 delete-vpc-endpoints --region "$region" --vpc-endpoint-ids "$vpce" || true
+  done
+
+  # 8. Cleanup Transit Gateway Attachments
+  echo "Checking for Transit Gateway Attachments..."
+  local tgw_attachments
+  tgw_attachments="$(aws ec2 describe-transit-gateway-vpc-attachments --region "$region" \
+    --filters "Name=vpc-id,Values=${vpc_id}" \
+    --query 'TransitGatewayVpcAttachments[*].TransitGatewayAttachmentId' --output text 2>/dev/null || true)"
+  for tgw_att in $tgw_attachments; do
+    echo "Deleting Transit Gateway Attachment: ${tgw_att}"
+    aws ec2 delete-transit-gateway-vpc-attachment --region "$region" --transit-gateway-attachment-id "$tgw_att" || true
+  done
+
+  # 9. Cleanup VPC Peering Connections
+  echo "Checking for VPC Peering Connections..."
+  local peer_ids
+  peer_ids="$(aws ec2 describe-vpc-peering-connections --region "$region" \
+    --filters "Name=requester-vpc-info.vpc-id,Values=${vpc_id}" \
+    --query 'VpcPeeringConnections[*].VpcPeeringConnectionId' --output text)"
+  peer_ids+=" $(aws ec2 describe-vpc-peering-connections --region "$region" \
+    --filters "Name=accepter-vpc-info.vpc-id,Values=${vpc_id}" \
+    --query 'VpcPeeringConnections[*].VpcPeeringConnectionId' --output text)"
+  for peer in $peer_ids; do
+    if [[ -n "$peer" && "$peer" != "None" ]]; then
+      echo "Deleting VPC Peering Connection: ${peer}"
+      aws ec2 delete-vpc-peering-connection --region "$region" --vpc-peering-connection-id "$peer" || true
+    fi
+  done
+
+  # 10. Cleanup Security Groups (must go before ENIs to break SG→ENI dependency cycles)
+  echo "Checking for orphaned Security Groups..."
+  local sg_ids
+  sg_ids="$(aws ec2 describe-security-groups --region "$region" \
+    --filters "Name=vpc-id,Values=${vpc_id}" \
+    --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text)"
+  for sg in $sg_ids; do
+    echo "Stripping rules from SG: ${sg}"
+    aws ec2 revoke-security-group-ingress --region "$region" --group-id "$sg" \
+      --ip-permissions "$(aws ec2 describe-security-groups --region "$region" --group-ids "$sg" \
+      --query 'SecurityGroups[0].IpPermissions' --output json)" >/dev/null 2>&1 || true
+    aws ec2 revoke-security-group-egress --region "$region" --group-id "$sg" \
+      --ip-permissions "$(aws ec2 describe-security-groups --region "$region" --group-ids "$sg" \
+      --query 'SecurityGroups[0].IpPermissionsEgress' --output json)" >/dev/null 2>&1 || true
+  done
+  for sg in $sg_ids; do
+    echo "Deleting SG: ${sg}"
+    aws ec2 delete-security-group --region "$region" --group-id "$sg" 2>/dev/null || true
+  done
+
+  # 11. Cleanup ENIs with retry loop — EKS-managed ENIs can take 60s+ to release
+  echo "Performing ENI sweep for VPC: ${vpc_id} (with retries)..."
+  local eni_retry
+  for eni_retry in {1..6}; do
+    local eni_ids
+    eni_ids="$(aws ec2 describe-network-interfaces --region "$region" \
+      --filters "Name=vpc-id,Values=${vpc_id}" \
+      --query 'NetworkInterfaces[*].NetworkInterfaceId' --output text)"
+
+    if [[ -z "$eni_ids" ]]; then
+      echo "All ENIs cleaned up."
+      break
+    fi
+
+    echo "ENI sweep attempt ${eni_retry}/6 — found ENIs: ${eni_ids}"
+    for eni in $eni_ids; do
+      local eni_status
+      eni_status="$(aws ec2 describe-network-interfaces --region "$region" \
+        --network-interface-ids "$eni" \
+        --query 'NetworkInterfaces[0].Status' --output text 2>/dev/null || echo "GONE")"
+      [[ "$eni_status" == "GONE" ]] && continue
+
+      if [[ "$eni_status" == "in-use" ]]; then
+        local attachment_id
+        attachment_id="$(aws ec2 describe-network-interfaces --region "$region" \
+          --network-interface-ids "$eni" \
+          --query 'NetworkInterfaces[0].Attachment.AttachmentId' --output text 2>/dev/null || echo "None")"
+        if [[ -n "$attachment_id" && "$attachment_id" != "None" ]]; then
+          echo "Force-detaching ENI: ${eni} (attachment: ${attachment_id})"
+          aws ec2 detach-network-interface --region "$region" --attachment-id "$attachment_id" --force 2>/dev/null || true
+        fi
+      else
+        echo "Deleting available ENI: ${eni}"
+        aws ec2 delete-network-interface --region "$region" --network-interface-id "$eni" 2>/dev/null || true
+      fi
+    done
+
+    if [[ "$eni_retry" -lt 6 ]]; then
+      echo "Waiting 15s for ENIs to finish detaching..."
+      sleep 15
+    fi
+  done
+
+  # Final pass: delete any ENIs that are now available after detach
+  local leftover_enis
+  leftover_enis="$(aws ec2 describe-network-interfaces --region "$region" \
+    --filters "Name=vpc-id,Values=${vpc_id}" "Name=status,Values=available" \
+    --query 'NetworkInterfaces[*].NetworkInterfaceId' --output text)"
+  for eni in $leftover_enis; do
+    echo "Deleting leftover ENI: ${eni}"
+    aws ec2 delete-network-interface --region "$region" --network-interface-id "$eni" 2>/dev/null || true
+  done
+
+  # 12. Release ALL Elastic IPs associated with this VPC (final sweep)
+  # This catches EIPs on ENIs, orphaned NAT GW EIPs from prior runs, etc.
+  echo "Final EIP sweep for VPC ${vpc_id}..."
+  local all_eips_json
+  all_eips_json="$(aws ec2 describe-addresses --region "$region" \
+    --query 'Addresses[*].{AllocationId:AllocationId,AssociationId:AssociationId,NetworkInterfaceId:NetworkInterfaceId,Tags:Tags}' \
+    --output json 2>/dev/null || echo "[]")"
+
+  local eip_count
+  eip_count="$(echo "$all_eips_json" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)"
+
+  local idx
+  for idx in $(seq 0 $(( eip_count - 1 ))); do
+    local alloc assoc_id eni_id tags_json
+    alloc="$(echo "$all_eips_json" | python3 -c "import sys,json; d=json.load(sys.stdin)[$idx]; print(d.get('AllocationId',''))" 2>/dev/null)"
+    assoc_id="$(echo "$all_eips_json" | python3 -c "import sys,json; d=json.load(sys.stdin)[$idx]; print(d.get('AssociationId') or '')" 2>/dev/null)"
+    eni_id="$(echo "$all_eips_json" | python3 -c "import sys,json; d=json.load(sys.stdin)[$idx]; print(d.get('NetworkInterfaceId') or '')" 2>/dev/null)"
+    tags_json="$(echo "$all_eips_json" | python3 -c "import sys,json; d=json.load(sys.stdin)[$idx]; print(' '.join(t.get('Value','') for t in (d.get('Tags') or [])))" 2>/dev/null)"
+
+    [[ -z "$alloc" ]] && continue
+
+    local should_release="false"
+
+    if [[ -n "$eni_id" ]]; then
+      # EIP attached to an ENI — check if ENI is in our VPC
+      local eni_vpc
+      eni_vpc="$(aws ec2 describe-network-interfaces --region "$region" \
+        --network-interface-ids "$eni_id" \
+        --query 'NetworkInterfaces[0].VpcId' --output text 2>/dev/null || echo "None")"
+      if [[ "$eni_vpc" == "$vpc_id" ]]; then
+        should_release="true"
+        if [[ -n "$assoc_id" ]]; then
+          echo "Disassociating EIP ${alloc} from ENI ${eni_id}"
+          aws ec2 disassociate-address --region "$region" --association-id "$assoc_id" 2>/dev/null || true
+          sleep 2
+        fi
+      fi
+    else
+      # Unassociated EIP — check tags for VPC ID, cluster name, or base name
+      if echo "$tags_json" | grep -qiE "${vpc_id}|${cluster_name}|${base_pattern}"; then
+        should_release="true"
+      fi
+    fi
+
+    if [[ "$should_release" == "true" ]]; then
+      echo "Releasing EIP: ${alloc}"
+      aws ec2 release-address --region "$region" --allocation-id "$alloc" 2>/dev/null || true
+    fi
+  done
+
+  # 13. Cleanup custom route table associations (prevents subnet deletion failures)
+  echo "Cleaning up route table associations..."
+  local rt_ids
+  rt_ids="$(aws ec2 describe-route-tables --region "$region" \
+    --filters "Name=vpc-id,Values=${vpc_id}" \
+    --query 'RouteTables[*].RouteTableId' --output text)"
+  for rt in $rt_ids; do
+    local assoc_ids
+    assoc_ids="$(aws ec2 describe-route-tables --region "$region" \
+      --route-table-ids "$rt" \
+      --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' --output text)"
+    for assoc in $assoc_ids; do
+      [[ -z "$assoc" || "$assoc" == "None" ]] && continue
+      echo "Disassociating route table ${rt} association ${assoc}"
+      aws ec2 disassociate-route-table --region "$region" --association-id "$assoc" 2>/dev/null || true
+    done
+  done
+
+  # Delete non-main route tables
+  for rt in $rt_ids; do
+    local is_main
+    is_main="$(aws ec2 describe-route-tables --region "$region" --route-table-ids "$rt" \
+      --query 'RouteTables[0].Associations[?Main==`true`] | length(@)' --output text 2>/dev/null || echo "0")"
+    if [[ "$is_main" == "0" ]]; then
+      echo "Deleting route table: ${rt}"
+      aws ec2 delete-route-table --region "$region" --route-table-id "$rt" 2>/dev/null || true
+    fi
+  done
+
+  # 14. Retry SG deletion now that ENIs are gone
+  sg_ids="$(aws ec2 describe-security-groups --region "$region" \
+    --filters "Name=vpc-id,Values=${vpc_id}" \
+    --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text)"
+  for sg in $sg_ids; do
+    echo "Retrying SG deletion: ${sg}"
+    aws ec2 delete-security-group --region "$region" --group-id "$sg" 2>/dev/null || true
+  done
+
+  echo "AWS resource cleanup complete for VPC: ${vpc_id}"
+}
+
+delete_kubernetes_lb_resources_aks() {
+  local cluster_name="$1"
+  local region="$2"
+  local rg="rg-${cluster_name}"
+
+  echo "Attempting to delete Kubernetes LoadBalancer services for AKS cluster: ${cluster_name}..."
+
+  # Get kubeconfig if cluster is still running
+  local cluster_status
+  cluster_status="$(az aks show --name "$cluster_name" --resource-group "$rg" --query 'provisioningState' -o tsv 2>/dev/null || echo "UNKNOWN")"
+
+  if [[ "$cluster_status" == "Succeeded" || "$cluster_status" == "Deleting" ]]; then
+    az aks get-credentials --name "$cluster_name" --resource-group "$rg" --overwrite-existing >/dev/null 2>&1 || true
+    local context
+    context="$(resolve_kube_context "$cluster_name" || true)"
+    if [[ -n "$context" ]]; then
+      echo "Deleting Services of type LoadBalancer..."
+      kubectl --context "$context" get svc -A -o json 2>/dev/null | jq -r '.items[] | select(.spec.type=="LoadBalancer") | [.metadata.namespace, .metadata.name] | @tsv' | while read -r ns name; do
+        kubectl --context "$context" delete svc "$name" -n "$ns" --timeout=30s --wait=false || true
+      done
+      echo "Deleting Ingresses..."
+      kubectl --context "$context" delete ingress -A --all --timeout=30s --wait=false || true
+      sleep 15
+    fi
+  else
+    echo "Cluster status is ${cluster_status}, skipping Kubernetes-level cleanup."
+  fi
+}
+
+cleanup_aks_azure_resources() {
+  local cluster_name="$1"
+  local region="$2"
+  local rg="rg-${cluster_name}"
+
+  echo "Starting cleanup of Azure resources for AKS cluster: ${cluster_name}..."
+
+  # The MC_ (managed cluster) resource group holds the actual infra
+  local mc_rg
+  mc_rg="$(az aks show --name "$cluster_name" --resource-group "$rg" --query 'nodeResourceGroup' -o tsv 2>/dev/null || true)"
+
+  # 1. Delete load balancers in MC_ resource group
+  if [[ -n "$mc_rg" ]]; then
+    echo "Cleaning up MC resource group: ${mc_rg}..."
+    local lb_ids
+    lb_ids="$(az network lb list -g "$mc_rg" --query '[].id' -o tsv 2>/dev/null || true)"
+    for lb_id in $lb_ids; do
+      echo "Deleting load balancer: ${lb_id}"
+      az network lb delete --ids "$lb_id" 2>/dev/null || true
+    done
+
+    # Delete public IPs in MC_ resource group
+    local pip_ids
+    pip_ids="$(az network public-ip list -g "$mc_rg" --query '[].id' -o tsv 2>/dev/null || true)"
+    for pip_id in $pip_ids; do
+      echo "Deleting public IP: ${pip_id}"
+      az network public-ip delete --ids "$pip_id" 2>/dev/null || true
+    done
+  fi
+
+  # 2. Delete load balancers in the main resource group
+  local lb_ids
+  lb_ids="$(az network lb list -g "$rg" --query '[].id' -o tsv 2>/dev/null || true)"
+  for lb_id in $lb_ids; do
+    echo "Deleting load balancer: ${lb_id}"
+    az network lb delete --ids "$lb_id" 2>/dev/null || true
+  done
+
+  # 3. Delete public IPs in the main resource group
+  local pip_ids
+  pip_ids="$(az network public-ip list -g "$rg" --query '[].id' -o tsv 2>/dev/null || true)"
+  for pip_id in $pip_ids; do
+    echo "Deleting public IP: ${pip_id}"
+    az network public-ip delete --ids "$pip_id" 2>/dev/null || true
+  done
+
+  # 4. Delete NSGs (Network Security Groups) that block subnet deletion
+  local nsg_ids
+  nsg_ids="$(az network nsg list -g "$rg" --query '[].id' -o tsv 2>/dev/null || true)"
+  for nsg_id in $nsg_ids; do
+    echo "Deleting NSG: ${nsg_id}"
+    az network nsg delete --ids "$nsg_id" 2>/dev/null || true
+  done
+
+  # 5. Delete NICs that block subnet deletion
+  local nic_ids
+  nic_ids="$(az network nic list -g "$rg" --query '[].id' -o tsv 2>/dev/null || true)"
+  for nic_id in $nic_ids; do
+    echo "Deleting NIC: ${nic_id}"
+    az network nic delete --ids "$nic_id" 2>/dev/null || true
+  done
+
+  echo "Azure resource cleanup complete for cluster: ${cluster_name}"
+}
+
+delete_kubernetes_lb_resources_gke() {
+  local cluster_name="$1"
+  local region="$2"
+
+  echo "Attempting to delete Kubernetes LoadBalancer services for GKE cluster: ${cluster_name}..."
+
+  local cluster_status
+  cluster_status="$(gcloud container clusters describe "$cluster_name" --region "$region" \
+    --format='value(status)' 2>/dev/null || echo "UNKNOWN")"
+
+  if [[ "$cluster_status" == "RUNNING" || "$cluster_status" == "RECONCILING" ]]; then
+    gcloud container clusters get-credentials "$cluster_name" --region "$region" >/dev/null 2>&1 || true
+    local context
+    context="$(resolve_kube_context "$cluster_name" || true)"
+    if [[ -n "$context" ]]; then
+      echo "Deleting Services of type LoadBalancer..."
+      kubectl --context "$context" get svc -A -o json 2>/dev/null | jq -r '.items[] | select(.spec.type=="LoadBalancer") | [.metadata.namespace, .metadata.name] | @tsv' | while read -r ns name; do
+        kubectl --context "$context" delete svc "$name" -n "$ns" --timeout=30s --wait=false || true
+      done
+      echo "Deleting Ingresses..."
+      kubectl --context "$context" delete ingress -A --all --timeout=30s --wait=false || true
+      sleep 15
+    fi
+  else
+    echo "Cluster status is ${cluster_status}, skipping Kubernetes-level cleanup."
+  fi
+}
+
+cleanup_gke_gcp_resources() {
+  local cluster_name="$1"
+  local region="$2"
+
+  echo "Starting cleanup of GCP resources for GKE cluster: ${cluster_name}..."
+
+  local project_id
+  project_id="$(gcloud config get-value project 2>/dev/null | tr -d '\r')"
+  if [[ -z "$project_id" || "$project_id" == "(unset)" ]]; then
+    echo "gcloud project not set, skipping GCP cleanup."
+    return 0
+  fi
+
+  # Derive VPC name from cluster name: base_name-env-gke-vpc
+  local base_env="${cluster_name%-gke}"
+  local vpc_name="${cluster_name}-vpc"
+
+  # Verify VPC exists
+  local vpc_self_link
+  vpc_self_link="$(gcloud compute networks describe "$vpc_name" --project "$project_id" \
+    --format='value(selfLink)' 2>/dev/null || true)"
+
+  if [[ -z "$vpc_self_link" ]]; then
+    echo "VPC ${vpc_name} not found, skipping GCP resource cleanup."
+    return 0
+  fi
+  echo "Target VPC for cleanup: ${vpc_name}"
+
+  # 1. Disable deletion protection on the GKE cluster (required for prod clusters)
+  echo "Disabling deletion protection on cluster ${cluster_name}..."
+  gcloud container clusters update "$cluster_name" --region "$region" --project "$project_id" \
+    --no-deletion-protection --quiet 2>/dev/null || true
+
+  # 2. Delete forwarding rules (load balancer frontends) in the VPC
+  echo "Checking for forwarding rules..."
+  local fwd_rules
+  fwd_rules="$(gcloud compute forwarding-rules list --project "$project_id" \
+    --filter="network:${vpc_name} OR network:${vpc_self_link}" \
+    --format='csv[no-heading](name,region.basename())' 2>/dev/null || true)"
+  while IFS=, read -r fr_name fr_region; do
+    [[ -z "$fr_name" ]] && continue
+    if [[ -n "$fr_region" ]]; then
+      echo "Deleting regional forwarding rule: ${fr_name}"
+      gcloud compute forwarding-rules delete "$fr_name" --region "$fr_region" --project "$project_id" --quiet 2>/dev/null || true
+    else
+      echo "Deleting global forwarding rule: ${fr_name}"
+      gcloud compute forwarding-rules delete "$fr_name" --global --project "$project_id" --quiet 2>/dev/null || true
+    fi
+  done <<< "$fwd_rules"
+
+  # 3. Delete target pools
+  echo "Checking for target pools..."
+  local target_pools
+  target_pools="$(gcloud compute target-pools list --project "$project_id" \
+    --filter="region:${region}" \
+    --format='value(name)' 2>/dev/null || true)"
+  for tp in $target_pools; do
+    echo "Deleting target pool: ${tp}"
+    gcloud compute target-pools delete "$tp" --region "$region" --project "$project_id" --quiet 2>/dev/null || true
+  done
+
+  # 4. Delete backend services
+  echo "Checking for backend services..."
+  local backend_svcs
+  backend_svcs="$(gcloud compute backend-services list --project "$project_id" \
+    --filter="network:${vpc_name} OR network:${vpc_self_link}" \
+    --format='csv[no-heading](name,region.basename())' 2>/dev/null || true)"
+  while IFS=, read -r bs_name bs_region; do
+    [[ -z "$bs_name" ]] && continue
+    if [[ -n "$bs_region" ]]; then
+      echo "Deleting regional backend service: ${bs_name}"
+      gcloud compute backend-services delete "$bs_name" --region "$bs_region" --project "$project_id" --quiet 2>/dev/null || true
+    else
+      echo "Deleting global backend service: ${bs_name}"
+      gcloud compute backend-services delete "$bs_name" --global --project "$project_id" --quiet 2>/dev/null || true
+    fi
+  done <<< "$backend_svcs"
+
+  # 5. Delete health checks associated with the cluster
+  echo "Checking for health checks..."
+  local health_checks
+  health_checks="$(gcloud compute health-checks list --project "$project_id" \
+    --filter="name~${base_env}" \
+    --format='value(name)' 2>/dev/null || true)"
+  for hc in $health_checks; do
+    echo "Deleting health check: ${hc}"
+    gcloud compute health-checks delete "$hc" --project "$project_id" --quiet 2>/dev/null || true
+  done
+
+  # 6. Delete firewall rules for the VPC
+  echo "Checking for firewall rules..."
+  local fw_rules
+  fw_rules="$(gcloud compute firewall-rules list --project "$project_id" \
+    --filter="network:${vpc_name} OR network:${vpc_self_link}" \
+    --format='value(name)' 2>/dev/null || true)"
+  for fw in $fw_rules; do
+    echo "Deleting firewall rule: ${fw}"
+    gcloud compute firewall-rules delete "$fw" --project "$project_id" --quiet 2>/dev/null || true
+  done
+
+  # 7. Delete Cloud NAT and router
+  local router_name="${base_env}-router"
+  echo "Deleting Cloud NAT and router: ${router_name}..."
+  local nats
+  nats="$(gcloud compute routers nats list --router "$router_name" --region "$region" --project "$project_id" \
+    --format='value(name)' 2>/dev/null || true)"
+  for nat_name in $nats; do
+    echo "Deleting Cloud NAT: ${nat_name}"
+    gcloud compute routers nats delete "$nat_name" --router "$router_name" --region "$region" \
+      --project "$project_id" --quiet 2>/dev/null || true
+  done
+  gcloud compute routers delete "$router_name" --region "$region" --project "$project_id" --quiet 2>/dev/null || true
+
+  # 8. Delete static external IP addresses
+  echo "Checking for external addresses..."
+  local addresses
+  addresses="$(gcloud compute addresses list --project "$project_id" \
+    --filter="region:${region} AND name~${base_env}" \
+    --format='value(name)' 2>/dev/null || true)"
+  for addr in $addresses; do
+    echo "Deleting address: ${addr}"
+    gcloud compute addresses delete "$addr" --region "$region" --project "$project_id" --quiet 2>/dev/null || true
+  done
+
+  echo "GCP resource cleanup complete for cluster: ${cluster_name}"
 }

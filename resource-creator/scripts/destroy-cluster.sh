@@ -139,7 +139,46 @@ esac
 
 pushd "${ROOT_DIR}/terraform/${TF_STACK}" >/dev/null
 terraform init -reconfigure -backend-config="$TF_BACKEND_FILE"
-terraform destroy -auto-approve -input=false -var-file="$TF_VARS_FILE"
+
+if [[ "$CLOUD" == "aws" ]]; then
+  echo "Executing PROACTIVE CLEANUP for AWS cluster to prevent Terraform hangs..."
+  delete_kubernetes_lb_resources "$CLUSTER_NAME" "$REGION" || true
+  cleanup_eks_addons_cli "$CLUSTER_NAME" "$REGION" || true
+  cleanup_eks_aws_resources "$CLUSTER_NAME" "$REGION"
+elif [[ "$CLOUD" == "azure" ]]; then
+  echo "Executing PROACTIVE CLEANUP for Azure cluster to prevent Terraform hangs..."
+  delete_kubernetes_lb_resources_aks "$CLUSTER_NAME" "$REGION" || true
+  cleanup_aks_azure_resources "$CLUSTER_NAME" "$REGION"
+elif [[ "$CLOUD" == "gcp" ]]; then
+  echo "Executing PROACTIVE CLEANUP for GCP cluster to prevent Terraform hangs..."
+  delete_kubernetes_lb_resources_gke "$CLUSTER_NAME" "$REGION" || true
+  cleanup_gke_gcp_resources "$CLUSTER_NAME" "$REGION"
+fi
+
+# Main Terraform destroy with retries
+MAX_RETRIES=3
+for attempt in $(seq 1 "$MAX_RETRIES"); do
+  echo "=== Terraform destroy attempt ${attempt}/${MAX_RETRIES} ==="
+  if terraform destroy -auto-approve -input=false -var-file="$TF_VARS_FILE"; then
+    break
+  fi
+
+  if [[ "$attempt" -eq "$MAX_RETRIES" ]]; then
+    echo "Terraform destroy failed after ${attempt} attempt(s)."
+    exit 1
+  fi
+
+  echo "Terraform destroy failed. Waiting 30s for resources to settle, then running cleanup sweep..."
+  sleep 30
+
+  if [[ "$CLOUD" == "aws" ]]; then
+    cleanup_eks_aws_resources "$CLUSTER_NAME" "$REGION"
+  elif [[ "$CLOUD" == "azure" ]]; then
+    cleanup_aks_azure_resources "$CLUSTER_NAME" "$REGION"
+  elif [[ "$CLOUD" == "gcp" ]]; then
+    cleanup_gke_gcp_resources "$CLUSTER_NAME" "$REGION"
+  fi
+done
 popd >/dev/null
 
 echo "Destroyed ${CLOUD} cluster set for name=${NAME} env=${ENV_NAME} region=${REGION}"
