@@ -71,14 +71,25 @@ if [[ "$CLOUD" == "aws" ]]; then
   aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$REGION" --alias "$CLUSTER_NAME" >/dev/null
 
   if ! kube_api_reachable; then
-    echo "Kubernetes API is unreachable. Ensuring public access is enabled..."
-    CALLER_IP="$(get_public_ip)"
-    ensure_eks_public_api_access "$CLUSTER_NAME" "$REGION" "${CALLER_IP}/32"
-    if ! wait_for_kube_api 36 10; then
-      echo "EKS API still unreachable after ensuring public endpoint access."
-      echo "Likely DNS propagation or network egress restriction from this machine."
-      echo "Retry in 2-3 minutes, or run from a network with direct internet egress."
-      exit 1
+    echo "Kubernetes API is unreachable. Checking cluster status and endpoint config..."
+
+    # First, ensure the cluster is ACTIVE (not UPDATING from a prior config change)
+    wait_for_eks_active "$CLUSTER_NAME" "$REGION"
+
+    # Refresh kubeconfig in case the endpoint address changed
+    aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$REGION" --alias "$CLUSTER_NAME" >/dev/null
+    flush_dns_cache
+
+    if ! kube_api_reachable; then
+      echo "Still unreachable after kubeconfig refresh. Ensuring public access includes this IP..."
+      CALLER_IP="$(get_public_ip)"
+      ensure_eks_public_api_access "$CLUSTER_NAME" "$REGION" "${CALLER_IP}/32"
+      if ! wait_for_kube_api 60 10; then
+        echo "EKS API still unreachable after ensuring public endpoint access."
+        echo "Likely DNS propagation or network egress restriction from this machine."
+        echo "Retry in 2-3 minutes, or run from a network with direct internet egress."
+        exit 1
+      fi
     fi
   fi
 fi

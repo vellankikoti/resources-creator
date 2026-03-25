@@ -262,6 +262,11 @@ wait_for_kube_api() {
     if kube_api_reachable; then
       return 0
     fi
+    # After several failed attempts, flush DNS cache in case of stale entries
+    if (( i % 6 == 0 )); then
+      echo "  API not yet reachable (attempt $i/$attempts), flushing DNS cache..."
+      flush_dns_cache
+    fi
     sleep "$sleep_seconds"
   done
   return 1
@@ -273,17 +278,63 @@ ensure_eks_public_api_access() {
   local region="$2"
   local cidr="$3"
 
+  # Fetch current endpoint config to avoid unnecessary updates
+  local current_config
+  current_config="$(aws eks describe-cluster --name "$cluster_name" --region "$region" \
+    --query 'cluster.resourcesVpcConfig.{public:endpointPublicAccess,cidrs:publicAccessCidrs}' --output json 2>/dev/null)"
+
+  local already_public
+  already_public="$(echo "$current_config" | jq -r '.public')"
+  local current_cidrs
+  current_cidrs="$(echo "$current_config" | jq -r '.cidrs[]' 2>/dev/null || true)"
+
+  # If already public with 0.0.0.0/0 or the requested CIDR, skip the update entirely
+  if [[ "$already_public" == "true" ]]; then
+    if echo "$current_cidrs" | grep -qF '0.0.0.0/0'; then
+      echo "Public endpoint already enabled with 0.0.0.0/0 — skipping update."
+      return 0
+    fi
+    if echo "$current_cidrs" | grep -qF "$cidr"; then
+      echo "Public endpoint already enabled with CIDR $cidr — skipping update."
+      return 0
+    fi
+  fi
+
+  # Merge caller CIDR with existing CIDRs rather than replacing them
+  local merged_cidrs="$cidr"
+  if [[ -n "$current_cidrs" ]]; then
+    merged_cidrs="$(printf '%s\n%s' "$current_cidrs" "$cidr" | sort -u | paste -sd ',' -)"
+  fi
+
+  echo "Enabling public endpoint access with CIDRs: $merged_cidrs"
   aws eks update-cluster-config \
     --name "$cluster_name" \
     --region "$region" \
-    --resources-vpc-config endpointPrivateAccess=true,endpointPublicAccess=true,publicAccessCidrs="$cidr" >/dev/null
+    --resources-vpc-config "endpointPrivateAccess=true,endpointPublicAccess=true,publicAccessCidrs=$merged_cidrs" >/dev/null
 
   aws eks wait cluster-active --name "$cluster_name" --region "$region"
+
+  # Flush local DNS cache to pick up the new endpoint address
+  flush_dns_cache
 }
 
 restore_eks_private_only() {
   local cluster_name="$1"
   local region="$2"
+
+  # Check current state — don't disable if Terraform manages it as public
+  local already_public
+  already_public="$(aws eks describe-cluster --name "$cluster_name" --region "$region" \
+    --query 'cluster.resourcesVpcConfig.endpointPublicAccess' --output text 2>/dev/null || echo "true")"
+  local current_cidrs
+  current_cidrs="$(aws eks describe-cluster --name "$cluster_name" --region "$region" \
+    --query 'cluster.resourcesVpcConfig.publicAccessCidrs' --output json 2>/dev/null || echo '[]')"
+
+  # If it has 0.0.0.0/0, it was intentionally configured public (by Terraform) — don't disable
+  if echo "$current_cidrs" | grep -qF '0.0.0.0/0'; then
+    echo "Cluster has 0.0.0.0/0 public access (Terraform-managed) — not disabling."
+    return 0
+  fi
 
   aws eks update-cluster-config \
     --name "$cluster_name" \
@@ -291,6 +342,18 @@ restore_eks_private_only() {
     --resources-vpc-config endpointPrivateAccess=true,endpointPublicAccess=false >/dev/null
 
   aws eks wait cluster-active --name "$cluster_name" --region "$region"
+}
+
+flush_dns_cache() {
+  # macOS
+  if command -v dscacheutil >/dev/null 2>&1; then
+    sudo dscacheutil -flushcache 2>/dev/null || true
+    sudo killall -HUP mDNSResponder 2>/dev/null || true
+  fi
+  # Linux systemd-resolved
+  if command -v resolvectl >/dev/null 2>&1; then
+    resolvectl flush-caches 2>/dev/null || true
+  fi
 }
 
 wait_for_eks_active() {

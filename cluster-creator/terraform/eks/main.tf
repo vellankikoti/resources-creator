@@ -1,9 +1,9 @@
 locals {
   env_config = {
-    dev     = { cidr = "10.20.0.0/16", min = 1, desired = 1, max = 2 }
-    qa      = { cidr = "10.21.0.0/16", min = 1, desired = 1, max = 2 }
-    staging = { cidr = "10.22.0.0/16", min = 1, desired = 1, max = 3 }
-    prod    = { cidr = "10.23.0.0/16", min = 2, desired = 2, max = 6 }
+    dev     = { cidr = "10.20.0.0/16", min = 1, desired = 1, max = 5 }
+    qa      = { cidr = "10.21.0.0/16", min = 1, desired = 1, max = 5 }
+    staging = { cidr = "10.22.0.0/16", min = 1, desired = 1, max = 8 }
+    prod    = { cidr = "10.23.0.0/16", min = 2, desired = 2, max = 12 }
   }
 
   selected = { for e in var.environments : e => local.env_config[e] }

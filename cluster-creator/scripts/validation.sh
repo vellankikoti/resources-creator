@@ -77,10 +77,18 @@ kctl() {
 
 if ! kctl --request-timeout=10s get --raw='/readyz' >/dev/null 2>&1; then
   if [[ "$CLOUD" == "aws" && "$PUBLIC_API" == "true" ]]; then
-    CALLER_IP="$(get_public_ip)"
-    ensure_eks_public_api_access "$CLUSTER_NAME" "$REGION" "${CALLER_IP}/32"
-    AWS_PUBLIC_API_TEMP_ENABLED="true"
-    if ! wait_for_kube_api 36 10 || ! kctl --request-timeout=15s get --raw='/readyz' >/dev/null 2>&1; then
+    # Ensure cluster is ACTIVE before attempting config changes
+    wait_for_eks_active "$CLUSTER_NAME" "$REGION"
+    aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$REGION" --alias "$CLUSTER_NAME" >/dev/null
+    flush_dns_cache
+
+    if ! kube_api_reachable; then
+      CALLER_IP="$(get_public_ip)"
+      ensure_eks_public_api_access "$CLUSTER_NAME" "$REGION" "${CALLER_IP}/32"
+      AWS_PUBLIC_API_TEMP_ENABLED="true"
+    fi
+
+    if ! wait_for_kube_api 60 10 || ! kctl --request-timeout=15s get --raw='/readyz' >/dev/null 2>&1; then
       echo "EKS API still unreachable after enabling temporary public endpoint."
       echo "Likely DNS propagation or network egress restriction from this machine."
       echo "Retry in 2-3 minutes, or run from a network with direct internet egress."
