@@ -1,6 +1,8 @@
 args:
   - --kubelet-preferred-address-types=InternalIP
   - --kubelet-use-node-status-port
+  - --kubelet-insecure-tls
+  - --metric-resolution=30s
 replicas: 2
 resources:
   requests:
@@ -9,3 +11,7 @@ resources:
   limits:
     cpu: 200m
     memory: 300Mi
+hostNetwork:
+  enabled: false
+apiService:
+  insecureSkipTLSVerify: true
