@@ -28,6 +28,12 @@ variable "tags" {
     owner       = "platform-team"
     managed_by  = "terraform"
     cost_center = "k8s-shared"
-    repo        = "resource-creator"
+    repo        = "cluster-creator"
   }
+}
+
+variable "aad_admin_group_ids" {
+  type        = list(string)
+  description = "Azure AD group object IDs for cluster admin access (exec, logs, full RBAC)"
+  default     = []
 }

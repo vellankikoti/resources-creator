@@ -79,6 +79,16 @@ resource "google_container_cluster" "gke" {
   monitoring_service       = "monitoring.googleapis.com/kubernetes"
   deletion_protection      = each.key == "prod"
 
+  # Enable managed metrics-server (GKE handles it natively)
+  monitoring_config {
+    enable_components = ["SYSTEM_COMPONENTS", "APISERVER", "SCHEDULER", "CONTROLLER_MANAGER"]
+    managed_prometheus { enabled = true }
+  }
+
+  logging_config {
+    enable_components = ["SYSTEM_COMPONENTS", "WORKLOADS"]
+  }
+
   release_channel {
     channel = each.key == "prod" ? "REGULAR" : "STABLE"
   }

@@ -105,6 +105,45 @@ module "eks" {
   authentication_mode                    = "API_AND_CONFIG_MAP"
   cloudwatch_log_group_retention_in_days = each.key == "prod" ? 14 : 7
 
+  # Allow control plane to reach nodes for exec, logs, port-forward, metrics
+  cluster_security_group_additional_rules = {
+    egress_to_nodes_kubelet = {
+      description                = "Cluster API to node kubelet for exec/logs/metrics"
+      protocol                   = "tcp"
+      from_port                  = 10250
+      to_port                    = 10250
+      type                       = "egress"
+      source_node_security_group = true
+    }
+    egress_to_nodes_https = {
+      description                = "Cluster API to node HTTPS"
+      protocol                   = "tcp"
+      from_port                  = 443
+      to_port                    = 443
+      type                       = "egress"
+      source_node_security_group = true
+    }
+    egress_to_nodes_ephemeral = {
+      description                = "Cluster API to node ephemeral ports"
+      protocol                   = "tcp"
+      from_port                  = 1025
+      to_port                    = 65535
+      type                       = "egress"
+      source_node_security_group = true
+    }
+  }
+
+  node_security_group_additional_rules = {
+    ingress_allow_api_to_kubelet = {
+      description                   = "API server to kubelet for exec/logs"
+      protocol                      = "tcp"
+      from_port                     = 10250
+      to_port                       = 10250
+      type                          = "ingress"
+      source_cluster_security_group = true
+    }
+  }
+
   cluster_addons = {
     coredns    = { most_recent = true }
     kube-proxy = { most_recent = true }

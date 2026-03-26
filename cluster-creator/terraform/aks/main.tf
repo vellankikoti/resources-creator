@@ -73,10 +73,18 @@ resource "azurerm_kubernetes_cluster" "aks" {
   azure_policy_enabled             = true
   role_based_access_control_enabled = true
   sku_tier                         = each.key == "prod" ? "Standard" : "Free"
+  local_account_disabled           = false
+
+  azure_active_directory_role_based_access_control {
+    azure_rbac_enabled = true
+    admin_group_object_ids = var.aad_admin_group_ids
+  }
 
   oms_agent {
     log_analytics_workspace_id = azurerm_log_analytics_workspace.law[each.key].id
   }
+
+  monitor_metrics {}
 
   network_profile {
     network_plugin    = "azure"
