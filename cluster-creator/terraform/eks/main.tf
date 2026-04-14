@@ -105,7 +105,8 @@ module "eks" {
   authentication_mode                    = "API_AND_CONFIG_MAP"
   cloudwatch_log_group_retention_in_days = each.key == "prod" ? 14 : 7
 
-  # Allow control plane to reach nodes for exec, logs, port-forward, metrics
+  # Allow control plane to reach nodes for exec, logs, port-forward, metrics.
+  # The module's cluster SG has no default egress, so we add these explicitly.
   cluster_security_group_additional_rules = {
     egress_to_nodes_kubelet = {
       description                = "Cluster API to node kubelet for exec/logs/metrics"
@@ -133,16 +134,10 @@ module "eks" {
     }
   }
 
-  node_security_group_additional_rules = {
-    ingress_allow_api_to_kubelet = {
-      description                   = "API server to kubelet for exec/logs"
-      protocol                      = "tcp"
-      from_port                     = 10250
-      to_port                       = 10250
-      type                          = "ingress"
-      source_cluster_security_group = true
-    }
-  }
+  # NOTE: do NOT add a node_security_group_additional_rules entry for
+  # kubelet/10250 — the module already creates `ingress_cluster_kubelet` by
+  # default (see modules/eks/node_groups.tf). Declaring it again causes
+  # AuthorizeSecurityGroupIngress to fail with InvalidPermission.Duplicate.
 
   cluster_addons = {
     coredns    = { most_recent = true }
