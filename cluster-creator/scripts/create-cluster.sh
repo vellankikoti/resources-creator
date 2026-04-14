@@ -34,6 +34,10 @@ while [[ $# -gt 0 ]]; do
       FULL_VALIDATION="true"
       shift 1
       ;;
+    --yes|-y)
+      export ASSUME_YES=1
+      shift 1
+      ;;
     *)
       echo "Unknown arg: $1"
       exit 1
@@ -42,7 +46,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$CLOUD" || -z "$NAME" || -z "$ENV_NAME" || -z "$REGION" ]]; then
-  echo "Usage: $0 --cloud aws|gcp|azure --name <name> --env dev|qa|staging|prod --region <region> [--public-api] [--full-validation]"
+  echo "Usage: $0 --cloud aws|gcp|azure --name <name> --env dev|qa|staging|prod --region <region> [--public-api] [--full-validation] [--yes]"
   exit 1
 fi
 
@@ -65,6 +69,7 @@ case "$CLOUD" in
   aws)
     require_cmd aws
     check_aws_quotas "$REGION"
+    check_aws_vpc_quota "$REGION"
 
     ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
     SUFFIX="${ACCOUNT_ID: -6}"
@@ -103,6 +108,7 @@ TFVARS
     [[ -n "$PROJECT_ID" && "$PROJECT_ID" != "(unset)" ]] || { echo "gcloud project is not set"; exit 1; }
 
     check_gcp_quotas_and_apis "$REGION" "$PROJECT_ID"
+    check_gcp_network_quota "$REGION" "$PROJECT_ID"
 
     PROJ_HASH="$(hash8 "$PROJECT_ID")"
     if [[ "$NAME" == *"-${ENV_NAME}-gke" ]]; then
@@ -142,6 +148,7 @@ TFVARS
     require_cmd az
     SUB_ID="$(az account show --query id -o tsv)"
     check_azure_quotas "$REGION"
+    check_azure_vnet_quota "$REGION"
 
     SUB_HASH="$(hash8 "$SUB_ID")"
     if [[ "$NAME" == *"-${ENV_NAME}-aks" ]]; then

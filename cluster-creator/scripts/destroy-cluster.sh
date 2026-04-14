@@ -29,6 +29,10 @@ while [[ $# -gt 0 ]]; do
       PUBLIC_API="true"
       shift 1
       ;;
+    --yes|-y)
+      export ASSUME_YES=1
+      shift 1
+      ;;
     *)
       echo "Unknown arg: $1"
       exit 1
@@ -37,7 +41,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$CLOUD" || -z "$NAME" || -z "$ENV_NAME" || -z "$REGION" ]]; then
-  echo "Usage: $0 --cloud aws|gcp|azure --name <name> --env dev|qa|staging|prod --region <region> [--public-api]"
+  echo "Usage: $0 --cloud aws|gcp|azure --name <name> --env dev|qa|staging|prod --region <region> [--public-api] [--yes]"
   exit 1
 fi
 
@@ -162,15 +166,17 @@ fi
 
 # Main Terraform destroy with retries
 MAX_RETRIES=3
+DESTROY_OK="false"
 for attempt in $(seq 1 "$MAX_RETRIES"); do
   echo "=== Terraform destroy attempt ${attempt}/${MAX_RETRIES} ==="
   if terraform destroy -auto-approve -input=false -var-file="$TF_VARS_FILE"; then
+    DESTROY_OK="true"
     break
   fi
 
   if [[ "$attempt" -eq "$MAX_RETRIES" ]]; then
     echo "Terraform destroy failed after ${attempt} attempt(s)."
-    exit 1
+    break
   fi
 
   echo "Terraform destroy failed. Waiting 30s for resources to settle, then running cleanup sweep..."
@@ -185,5 +191,18 @@ for attempt in $(seq 1 "$MAX_RETRIES"); do
   fi
 done
 popd >/dev/null
+
+# Post-destroy verification: confirm the VPC/VNet/network is actually gone.
+# If Terraform reported success we still verify (defense in depth).
+# If Terraform failed we run verify with its own retry+sweep loop.
+echo ""
+echo "=== Post-destroy verification ==="
+if ! post_destroy_verify "$CLOUD" "$CLUSTER_NAME" "$REGION"; then
+  exit 1
+fi
+
+if [[ "$DESTROY_OK" != "true" ]]; then
+  echo "Terraform destroy did not complete cleanly, but verification passed — resources are gone."
+fi
 
 echo "Destroyed ${CLOUD} cluster set for name=${NAME} env=${ENV_NAME} region=${REGION}"

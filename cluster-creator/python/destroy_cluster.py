@@ -18,6 +18,7 @@ from cluster_lib import (
     ROOT_DIR,
     TF_STACK,
     derive_cluster_info,
+    post_destroy_verify,
     prepare_backend,
     pre_destroy_cleanup,
     retry_cleanup,
@@ -38,6 +39,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--env", required=True, choices=VALID_ENVS,
                    dest="env_name")
     p.add_argument("--region", required=True)
+    p.add_argument("--yes", "-y", action="store_true", default=False,
+                   help="Non-interactive mode")
     return p.parse_args()
 
 
@@ -47,6 +50,9 @@ def main() -> None:
     name = args.name
     env_name = args.env_name
     region = args.region
+
+    if args.yes:
+        os.environ["ASSUME_YES"] = "1"
 
     info = derive_cluster_info(cloud, name, env_name, region)
     cluster_name = info["cluster_name"]
@@ -79,14 +85,16 @@ def main() -> None:
             print(f"Pre-cleanup warning (non-fatal): {e}")
 
         # Terraform destroy with retries
+        destroy_ok = False
         for attempt in range(1, MAX_RETRIES + 1):
             print(f"\n=== Terraform destroy attempt {attempt}/{MAX_RETRIES} ===")
             if terraform_destroy(vars_file):
+                destroy_ok = True
                 break
 
             if attempt == MAX_RETRIES:
                 print(f"Terraform destroy failed after {attempt} attempts.")
-                sys.exit(1)
+                break
 
             print("Terraform destroy failed. Waiting 30s, then running "
                   "cleanup sweep...")
@@ -95,6 +103,15 @@ def main() -> None:
                 retry_cleanup(cloud, cluster_name, region)
             except Exception as e:
                 print(f"Retry cleanup warning: {e}")
+
+    # Post-destroy verification: confirm network resources are actually gone.
+    print("\n=== Post-destroy verification ===")
+    if not post_destroy_verify(cloud, cluster_name, region):
+        sys.exit(1)
+
+    if not destroy_ok:
+        print("Terraform destroy did not complete cleanly, but verification "
+              "passed — resources are gone.")
 
     print(f"\nDestroyed {cloud.upper()} cluster: {cluster_name} "
           f"(name={name} env={env_name} region={region})")

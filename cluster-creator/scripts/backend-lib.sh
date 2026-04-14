@@ -1027,3 +1027,398 @@ cleanup_gke_gcp_resources() {
 
   echo "GCP resource cleanup complete for cluster: ${cluster_name}"
 }
+
+# ============================================================================
+# Robustness: quota preflight, orphan cleanup, post-destroy verification
+# ============================================================================
+
+is_noninteractive() {
+  if [[ "${NONINTERACTIVE:-0}" == "1" || "${ASSUME_YES:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ -t 0 && -t 1 ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# ----- AWS: VPC quota preflight -----
+check_aws_vpc_quota() {
+  local region="$1"
+  local vpc_quota vpc_used
+  vpc_quota="$(aws service-quotas get-service-quota --service-code vpc --quota-code L-F678F1CE --region "$region" \
+    --query 'Quota.Value' --output text 2>/dev/null || echo 5)"
+  vpc_quota="${vpc_quota%%.*}"
+  [[ -z "$vpc_quota" || "$vpc_quota" == "None" ]] && vpc_quota=5
+  vpc_used="$(aws ec2 describe-vpcs --region "$region" --query 'length(Vpcs)' --output text 2>/dev/null || echo 0)"
+
+  if (( vpc_used + 1 <= vpc_quota )); then
+    echo "AWS VPC quota OK in ${region}: ${vpc_used}/${vpc_quota}"
+    return 0
+  fi
+
+  echo ""
+  echo "⚠️  AWS VPC limit reached in ${region}: ${vpc_used}/${vpc_quota}"
+  echo "Existing VPCs:"
+  aws ec2 describe-vpcs --region "$region" \
+    --query 'Vpcs[*].[VpcId,CidrBlock,IsDefault,Tags[?Key==`Name`].Value|[0]]' \
+    --output table
+
+  if is_noninteractive; then
+    echo ""
+    echo "Non-interactive mode: aborting."
+    echo "To resolve:"
+    echo "  1. Delete unused VPCs manually"
+    echo "  2. Request quota increase: https://${region}.console.aws.amazon.com/servicequotas/home/services/vpc/quotas/L-F678F1CE"
+    exit 1
+  fi
+
+  echo ""
+  echo "Options:"
+  echo "  [A] Abort (safe default)"
+  echo "  [C] Clean up an orphan VPC (destructive: deletes NATs, ELBs, ENIs, SGs, subnets, VPC)"
+  echo "  [Q] Print quota-increase URL and abort"
+  local ans
+  read -r -p "Choose [A/C/Q] (default A): " ans </dev/tty || ans="A"
+  ans="${ans:-A}"
+  case "${ans^^}" in
+    C)
+      local target_vpc
+      read -r -p "Enter VPC ID to clean up (e.g. vpc-0abc...): " target_vpc </dev/tty || target_vpc=""
+      if [[ -z "$target_vpc" ]]; then
+        echo "No VPC ID entered. Aborting."
+        exit 1
+      fi
+      force_delete_aws_vpc "$target_vpc" "$region" || {
+        echo "Orphan VPC cleanup failed. Inspect cloud console and retry."
+        exit 1
+      }
+      # Re-check quota after cleanup
+      local new_used
+      new_used="$(aws ec2 describe-vpcs --region "$region" --query 'length(Vpcs)' --output text 2>/dev/null || echo 0)"
+      if (( new_used + 1 > vpc_quota )); then
+        echo "VPC count still at limit (${new_used}/${vpc_quota}). Aborting."
+        exit 1
+      fi
+      echo "VPC count now ${new_used}/${vpc_quota} — proceeding."
+      ;;
+    Q)
+      echo "Request quota increase at:"
+      echo "  https://${region}.console.aws.amazon.com/servicequotas/home/services/vpc/quotas/L-F678F1CE"
+      exit 1
+      ;;
+    *)
+      echo "Aborted."
+      exit 1
+      ;;
+  esac
+}
+
+force_delete_aws_vpc() {
+  local vpc_id="$1" region="$2"
+
+  local is_default
+  is_default="$(aws ec2 describe-vpcs --region "$region" --vpc-ids "$vpc_id" \
+    --query 'Vpcs[0].IsDefault' --output text 2>/dev/null || echo "true")"
+  if [[ "$is_default" == "true" ]]; then
+    echo "Refusing to delete default VPC: ${vpc_id}"
+    return 1
+  fi
+
+  local vpc_name
+  vpc_name="$(aws ec2 describe-vpcs --region "$region" --vpc-ids "$vpc_id" \
+    --query 'Vpcs[0].Tags[?Key==`Name`].Value|[0]' --output text 2>/dev/null || echo "")"
+  local base="${vpc_name%-vpc}"
+  base="${base:-orphan}"
+
+  echo "Force-cleaning VPC ${vpc_id} (Name: ${vpc_name:-unknown})..."
+
+  # Run the existing AWS nuclear sweep against this VPC's implied cluster name.
+  # cleanup_eks_aws_resources handles NATs, ELBs, ENIs, SGs, EIPs, route-tables within the VPC.
+  cleanup_eks_aws_resources "${base}-eks" "$region" || true
+
+  _teardown_empty_aws_vpc "$vpc_id" "$region"
+}
+
+_teardown_empty_aws_vpc() {
+  local vpc_id="$1" region="$2"
+
+  local igws
+  igws="$(aws ec2 describe-internet-gateways --region "$region" \
+    --filters "Name=attachment.vpc-id,Values=${vpc_id}" \
+    --query 'InternetGateways[*].InternetGatewayId' --output text 2>/dev/null || true)"
+  for igw in $igws; do
+    echo "Detaching + deleting IGW: ${igw}"
+    aws ec2 detach-internet-gateway --region "$region" --internet-gateway-id "$igw" --vpc-id "$vpc_id" 2>/dev/null || true
+    aws ec2 delete-internet-gateway --region "$region" --internet-gateway-id "$igw" 2>/dev/null || true
+  done
+
+  local subnets
+  subnets="$(aws ec2 describe-subnets --region "$region" \
+    --filters "Name=vpc-id,Values=${vpc_id}" \
+    --query 'Subnets[*].SubnetId' --output text 2>/dev/null || true)"
+  for subnet in $subnets; do
+    echo "Deleting subnet: ${subnet}"
+    aws ec2 delete-subnet --region "$region" --subnet-id "$subnet" 2>/dev/null || true
+  done
+
+  local rts
+  rts="$(aws ec2 describe-route-tables --region "$region" \
+    --filters "Name=vpc-id,Values=${vpc_id}" \
+    --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' --output text 2>/dev/null || true)"
+  for rt in $rts; do
+    echo "Deleting route table: ${rt}"
+    aws ec2 delete-route-table --region "$region" --route-table-id "$rt" 2>/dev/null || true
+  done
+
+  local sgs
+  sgs="$(aws ec2 describe-security-groups --region "$region" \
+    --filters "Name=vpc-id,Values=${vpc_id}" \
+    --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text 2>/dev/null || true)"
+  for sg in $sgs; do
+    echo "Deleting SG: ${sg}"
+    aws ec2 delete-security-group --region "$region" --group-id "$sg" 2>/dev/null || true
+  done
+
+  echo "Deleting VPC: ${vpc_id}"
+  if aws ec2 delete-vpc --region "$region" --vpc-id "$vpc_id" 2>&1; then
+    echo "VPC ${vpc_id} deleted."
+    return 0
+  else
+    echo "Failed to delete VPC ${vpc_id} — may still have dependencies."
+    return 1
+  fi
+}
+
+# ----- Azure: VNet quota preflight -----
+check_azure_vnet_quota() {
+  local region="$1"
+  local vnet_limit vnet_used
+  vnet_limit="$(az network list-usages --location "$region" \
+    --query "[?name.value=='VirtualNetworks'].limit | [0]" -o tsv 2>/dev/null || true)"
+  vnet_used="$(az network list-usages --location "$region" \
+    --query "[?name.value=='VirtualNetworks'].currentValue | [0]" -o tsv 2>/dev/null || true)"
+
+  if [[ -z "$vnet_limit" || -z "$vnet_used" ]]; then
+    echo "WARNING: unable to read Azure VNet quota for $region. Continuing."
+    return 0
+  fi
+
+  if (( vnet_used + 1 <= vnet_limit )); then
+    echo "Azure VNet quota OK in ${region}: ${vnet_used}/${vnet_limit}"
+    return 0
+  fi
+
+  echo ""
+  echo "⚠️  Azure VNet limit reached in ${region}: ${vnet_used}/${vnet_limit}"
+  echo "Existing VNets in this region:"
+  az network vnet list --query "[?location=='${region}'].{Name:name,RG:resourceGroup,CIDR:addressSpace.addressPrefixes[0]}" -o table 2>/dev/null || true
+
+  if is_noninteractive; then
+    echo ""
+    echo "Non-interactive mode: aborting. Delete unused resource groups or request quota increase."
+    exit 1
+  fi
+
+  echo ""
+  echo "Options:"
+  echo "  [A] Abort"
+  echo "  [C] Delete an orphan resource group (entire RG — destructive)"
+  local ans
+  read -r -p "Choose [A/C] (default A): " ans </dev/tty || ans="A"
+  ans="${ans:-A}"
+  case "${ans^^}" in
+    C)
+      local target_rg
+      read -r -p "Enter resource group name to delete: " target_rg </dev/tty || target_rg=""
+      if [[ -z "$target_rg" ]]; then
+        echo "No RG entered. Aborting."
+        exit 1
+      fi
+      echo "Deleting resource group: ${target_rg} (this may take several minutes)..."
+      if az group delete --name "$target_rg" --yes 2>&1; then
+        echo "Resource group ${target_rg} deleted."
+      else
+        echo "Failed to delete resource group. Aborting."
+        exit 1
+      fi
+      ;;
+    *)
+      echo "Aborted."
+      exit 1
+      ;;
+  esac
+}
+
+# ----- GCP: Network quota preflight -----
+check_gcp_network_quota() {
+  local region="$1" project_id="$2"
+  local nets_limit nets_used
+  nets_limit="$(gcloud compute project-info describe --project "$project_id" \
+    --format='csv[no-heading](quotas.metric,quotas.limit,quotas.usage)' 2>/dev/null \
+    | awk -F, '$1=="NETWORKS"{print $2; exit}')"
+  nets_used="$(gcloud compute project-info describe --project "$project_id" \
+    --format='csv[no-heading](quotas.metric,quotas.limit,quotas.usage)' 2>/dev/null \
+    | awk -F, '$1=="NETWORKS"{print $3; exit}')"
+  nets_limit="${nets_limit%%.*}"
+  nets_used="${nets_used%%.*}"
+
+  if [[ -z "$nets_limit" || -z "$nets_used" ]]; then
+    echo "WARNING: unable to read GCP NETWORKS quota. Continuing."
+    return 0
+  fi
+
+  if (( nets_used + 1 <= nets_limit )); then
+    echo "GCP NETWORKS quota OK: ${nets_used}/${nets_limit}"
+    return 0
+  fi
+
+  echo ""
+  echo "⚠️  GCP NETWORKS quota reached: ${nets_used}/${nets_limit}"
+  echo "Existing networks in project ${project_id}:"
+  gcloud compute networks list --project "$project_id" 2>/dev/null || true
+
+  if is_noninteractive; then
+    echo ""
+    echo "Non-interactive mode: aborting. Delete unused networks or request quota increase."
+    exit 1
+  fi
+
+  echo ""
+  echo "Options:"
+  echo "  [A] Abort"
+  echo "  [C] Delete an orphan network (and its subnets, routers, firewall rules)"
+  local ans
+  read -r -p "Choose [A/C] (default A): " ans </dev/tty || ans="A"
+  ans="${ans:-A}"
+  case "${ans^^}" in
+    C)
+      local target_net
+      read -r -p "Enter network name to delete: " target_net </dev/tty || target_net=""
+      if [[ -z "$target_net" ]]; then
+        echo "No network entered. Aborting."
+        exit 1
+      fi
+      force_delete_gcp_network "$target_net" "$region" "$project_id" || {
+        echo "Orphan network cleanup failed."
+        exit 1
+      }
+      ;;
+    *)
+      echo "Aborted."
+      exit 1
+      ;;
+  esac
+}
+
+force_delete_gcp_network() {
+  local net="$1" region="$2" project_id="$3"
+  echo "Force-cleaning GCP network: ${net}..."
+
+  local fws
+  fws="$(gcloud compute firewall-rules list --project "$project_id" \
+    --filter="network:${net}" --format='value(name)' 2>/dev/null || true)"
+  for fw in $fws; do
+    echo "Deleting firewall rule: ${fw}"
+    gcloud compute firewall-rules delete "$fw" --project "$project_id" --quiet 2>/dev/null || true
+  done
+
+  local routers_csv
+  routers_csv="$(gcloud compute routers list --project "$project_id" \
+    --filter="network:${net}" --format='csv[no-heading](name,region.basename())' 2>/dev/null || true)"
+  while IFS=, read -r r_name r_region; do
+    [[ -z "$r_name" ]] && continue
+    echo "Deleting router: ${r_name} in ${r_region}"
+    gcloud compute routers delete "$r_name" --region "$r_region" --project "$project_id" --quiet 2>/dev/null || true
+  done <<< "$routers_csv"
+
+  local subnets_csv
+  subnets_csv="$(gcloud compute networks subnets list --project "$project_id" \
+    --filter="network:${net}" --format='csv[no-heading](name,region.basename())' 2>/dev/null || true)"
+  while IFS=, read -r s_name s_region; do
+    [[ -z "$s_name" ]] && continue
+    echo "Deleting subnet: ${s_name} in ${s_region}"
+    gcloud compute networks subnets delete "$s_name" --region "$s_region" --project "$project_id" --quiet 2>/dev/null || true
+  done <<< "$subnets_csv"
+
+  echo "Deleting network: ${net}"
+  if gcloud compute networks delete "$net" --project "$project_id" --quiet 2>&1; then
+    echo "Network ${net} deleted."
+    return 0
+  else
+    echo "Failed to delete network ${net}."
+    return 1
+  fi
+}
+
+# ----- Post-destroy verification -----
+verify_aws_destroyed() {
+  local cluster_name="$1" region="$2"
+  local base="${cluster_name%-eks}"
+  local vpc_name="${base}-vpc"
+
+  local vpc_id
+  vpc_id="$(aws ec2 describe-vpcs --region "$region" \
+    --filters "Name=tag:Name,Values=${vpc_name}" \
+    --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "None")"
+
+  if [[ "$vpc_id" == "None" || -z "$vpc_id" ]]; then
+    echo "✅ Verify: VPC '${vpc_name}' is gone."
+    return 0
+  fi
+
+  echo "❌ Verify: VPC '${vpc_name}' (${vpc_id}) still exists."
+  return 1
+}
+
+verify_azure_destroyed() {
+  local cluster_name="$1" region="$2"
+  local rg="rg-${cluster_name}"
+  if az group show --name "$rg" >/dev/null 2>&1; then
+    echo "❌ Verify: Resource group '${rg}' still exists."
+    return 1
+  fi
+  echo "✅ Verify: Resource group '${rg}' is gone."
+  return 0
+}
+
+verify_gcp_destroyed() {
+  local cluster_name="$1" region="$2"
+  local project_id
+  project_id="$(gcloud config get-value project 2>/dev/null | tr -d '\r')"
+  local vpc_name="${cluster_name}-vpc"
+  if gcloud compute networks describe "$vpc_name" --project "$project_id" >/dev/null 2>&1; then
+    echo "❌ Verify: Network '${vpc_name}' still exists."
+    return 1
+  fi
+  echo "✅ Verify: Network '${vpc_name}' is gone."
+  return 0
+}
+
+post_destroy_verify() {
+  local cloud="$1" cluster_name="$2" region="$3"
+  local max=3 i
+  for i in $(seq 1 "$max"); do
+    case "$cloud" in
+      aws)   verify_aws_destroyed   "$cluster_name" "$region" && return 0 ;;
+      azure) verify_azure_destroyed "$cluster_name" "$region" && return 0 ;;
+      gcp)   verify_gcp_destroyed   "$cluster_name" "$region" && return 0 ;;
+    esac
+
+    if [[ $i -lt $max ]]; then
+      echo "Verify attempt ${i}/${max} failed. Running cleanup sweep..."
+      case "$cloud" in
+        aws)   cleanup_eks_aws_resources   "$cluster_name" "$region" || true ;;
+        azure) cleanup_aks_azure_resources "$cluster_name" "$region" || true ;;
+        gcp)   cleanup_gke_gcp_resources   "$cluster_name" "$region" || true ;;
+      esac
+      sleep 30
+    fi
+  done
+
+  echo ""
+  echo "❌ Post-destroy verification FAILED after ${max} attempts."
+  echo "   Orphaned resources remain. Check the cloud console and run the"
+  echo "   preflight orphan-cleanup path (option [C]) on the next create attempt."
+  return 1
+}

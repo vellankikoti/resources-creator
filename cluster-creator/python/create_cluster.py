@@ -21,6 +21,7 @@ import time
 from cluster_lib import (
     ROOT_DIR,
     TF_STACK,
+    check_vpc_quota,
     derive_cluster_info,
     get_public_ip,
     kube_api_reachable,
@@ -47,6 +48,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--region", required=True)
     p.add_argument("--public-api", action="store_true", default=False)
     p.add_argument("--full-validation", action="store_true", default=False)
+    p.add_argument("--yes", "-y", action="store_true", default=False,
+                   help="Non-interactive mode; skip prompts")
     return p.parse_args()
 
 
@@ -468,6 +471,17 @@ def main() -> None:
     require_cmd("terraform")
     require_cmd("kubectl")
     require_cmd("helm")
+
+    if args.yes:
+        os.environ["ASSUME_YES"] = "1"
+
+    gcp_project_id = None
+    if cloud == "gcp":
+        gcp_project_id = run_output(
+            ["gcloud", "config", "get-value", "project"],
+            check=False, quiet=True).strip()
+
+    check_vpc_quota(cloud, region, project_id=gcp_project_id)
 
     info = derive_cluster_info(cloud, name, env_name, region)
     cluster_name = info["cluster_name"]

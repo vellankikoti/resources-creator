@@ -1026,3 +1026,190 @@ def retry_cleanup(cloud: str, cluster_name: str, region: str) -> None:
         cleanup_aks_azure_resources(cluster_name, region)
     elif cloud == "gcp":
         cleanup_gke_gcp_resources(cluster_name, region)
+
+
+# ---------------------------------------------------------------------------
+# Robustness: VPC quota preflight + post-destroy verification
+# ---------------------------------------------------------------------------
+
+def _is_noninteractive() -> bool:
+    if os.environ.get("NONINTERACTIVE") == "1" or os.environ.get("ASSUME_YES") == "1":
+        return True
+    return not (sys.stdin.isatty() and sys.stdout.isatty())
+
+
+def _abort_vpc_quota(cloud: str, region: str, used: int, limit: int,
+                     extra: str = "") -> None:
+    print("")
+    print(f"⚠️  {cloud.upper()} network quota reached in {region}: {used}/{limit}")
+    print("To resolve:")
+    print("  1. Delete unused networks/VPCs manually")
+    print("  2. Request a quota increase in the cloud console")
+    if cloud == "aws":
+        print(f"     https://{region}.console.aws.amazon.com/servicequotas/"
+              f"home/services/vpc/quotas/L-F678F1CE")
+    print("  3. For interactive orphan cleanup, re-run via the shell script:")
+    print("     scripts/create-cluster.sh ...")
+    if extra:
+        print(extra)
+    sys.exit(1)
+
+
+def check_vpc_quota(cloud: str, region: str,
+                    project_id: Optional[str] = None) -> None:
+    """Preflight: verify network quota headroom for creating one more VPC.
+
+    Hard-fails with actionable guidance when at limit. The interactive
+    orphan-cleanup path is only available via the shell script.
+    """
+    try:
+        if cloud == "aws":
+            quota_raw = run_output(
+                ["aws", "service-quotas", "get-service-quota",
+                 "--service-code", "vpc", "--quota-code", "L-F678F1CE",
+                 "--region", region,
+                 "--query", "Quota.Value", "--output", "text"],
+                check=False, quiet=True) or "5"
+            limit = int(float(quota_raw)) if quota_raw not in ("", "None") else 5
+            used = int(run_output(
+                ["aws", "ec2", "describe-vpcs", "--region", region,
+                 "--query", "length(Vpcs)", "--output", "text"],
+                check=False, quiet=True) or "0")
+            if used + 1 > limit:
+                # Show the existing VPCs so the user can choose what to delete
+                print("Existing VPCs:")
+                run(["aws", "ec2", "describe-vpcs", "--region", region,
+                     "--query",
+                     "Vpcs[*].[VpcId,CidrBlock,IsDefault,Tags[?Key==`Name`].Value|[0]]",
+                     "--output", "table"], check=False, capture=False)
+                _abort_vpc_quota("aws", region, used, limit)
+            print(f"AWS VPC quota OK in {region}: {used}/{limit}")
+
+        elif cloud == "azure":
+            limit_raw = run_output(
+                ["az", "network", "list-usages", "--location", region,
+                 "--query", "[?name.value=='VirtualNetworks'].limit | [0]",
+                 "-o", "tsv"], check=False, quiet=True)
+            used_raw = run_output(
+                ["az", "network", "list-usages", "--location", region,
+                 "--query", "[?name.value=='VirtualNetworks'].currentValue | [0]",
+                 "-o", "tsv"], check=False, quiet=True)
+            if not limit_raw or not used_raw:
+                print(f"WARNING: unable to read Azure VNet quota for {region}. Continuing.")
+                return
+            limit = int(limit_raw)
+            used = int(used_raw)
+            if used + 1 > limit:
+                print("Existing VNets in this region:")
+                run(["az", "network", "vnet", "list",
+                     "--query", f"[?location=='{region}'].{{Name:name,RG:resourceGroup}}",
+                     "-o", "table"], check=False, capture=False)
+                _abort_vpc_quota("azure", region, used, limit)
+            print(f"Azure VNet quota OK in {region}: {used}/{limit}")
+
+        elif cloud == "gcp":
+            if not project_id:
+                print("WARNING: no project_id for GCP quota check. Skipping.")
+                return
+            csv = run_output(
+                ["gcloud", "compute", "project-info", "describe",
+                 "--project", project_id,
+                 "--format", "csv[no-heading](quotas.metric,quotas.limit,quotas.usage)"],
+                check=False, quiet=True)
+            limit = used = 0
+            for line in csv.splitlines():
+                parts = line.split(",")
+                if len(parts) >= 3 and parts[0] == "NETWORKS":
+                    try:
+                        limit = int(float(parts[1]))
+                        used = int(float(parts[2]))
+                    except ValueError:
+                        pass
+                    break
+            if limit == 0:
+                print("WARNING: unable to read GCP NETWORKS quota. Continuing.")
+                return
+            if used + 1 > limit:
+                print(f"Existing networks in project {project_id}:")
+                run(["gcloud", "compute", "networks", "list",
+                     "--project", project_id], check=False, capture=False)
+                _abort_vpc_quota("gcp", region, used, limit)
+            print(f"GCP NETWORKS quota OK: {used}/{limit}")
+    except subprocess.CalledProcessError as e:
+        print(f"WARNING: quota preflight failed ({e}). Continuing.")
+
+
+def _verify_aws_destroyed(cluster_name: str, region: str) -> bool:
+    base = cluster_name[:-len("-eks")] if cluster_name.endswith("-eks") else cluster_name
+    vpc_name = f"{base}-vpc"
+    vpc_id = run_output(
+        ["aws", "ec2", "describe-vpcs", "--region", region,
+         "--filters", f"Name=tag:Name,Values={vpc_name}",
+         "--query", "Vpcs[0].VpcId", "--output", "text"],
+        check=False, quiet=True) or "None"
+    if vpc_id in ("None", ""):
+        print(f"✅ Verify: VPC '{vpc_name}' is gone.")
+        return True
+    print(f"❌ Verify: VPC '{vpc_name}' ({vpc_id}) still exists.")
+    return False
+
+
+def _verify_azure_destroyed(cluster_name: str, region: str) -> bool:
+    rg = f"rg-{cluster_name}"
+    rc = subprocess.run(["az", "group", "show", "--name", rg],
+                        capture_output=True).returncode
+    if rc != 0:
+        print(f"✅ Verify: Resource group '{rg}' is gone.")
+        return True
+    print(f"❌ Verify: Resource group '{rg}' still exists.")
+    return False
+
+
+def _verify_gcp_destroyed(cluster_name: str, region: str) -> bool:
+    project_id = run_output(["gcloud", "config", "get-value", "project"],
+                            check=False, quiet=True).strip()
+    vpc_name = f"{cluster_name}-vpc"
+    rc = subprocess.run(
+        ["gcloud", "compute", "networks", "describe", vpc_name,
+         "--project", project_id],
+        capture_output=True).returncode
+    if rc != 0:
+        print(f"✅ Verify: Network '{vpc_name}' is gone.")
+        return True
+    print(f"❌ Verify: Network '{vpc_name}' still exists.")
+    return False
+
+
+def post_destroy_verify(cloud: str, cluster_name: str, region: str,
+                        max_attempts: int = 3) -> bool:
+    """Verify cluster network resources are actually gone after destroy.
+
+    On failure, run the cleanup sweep and retry up to max_attempts times.
+    Returns True if verification ultimately passes, False otherwise.
+    """
+    verifiers = {
+        "aws": _verify_aws_destroyed,
+        "azure": _verify_azure_destroyed,
+        "gcp": _verify_gcp_destroyed,
+    }
+    verifier = verifiers.get(cloud)
+    if verifier is None:
+        return True
+
+    for i in range(1, max_attempts + 1):
+        if verifier(cluster_name, region):
+            return True
+        if i < max_attempts:
+            print(f"Verify attempt {i}/{max_attempts} failed. "
+                  f"Running cleanup sweep...")
+            try:
+                retry_cleanup(cloud, cluster_name, region)
+            except Exception as e:
+                print(f"Cleanup sweep error (non-fatal): {e}")
+            time.sleep(30)
+
+    print("")
+    print(f"❌ Post-destroy verification FAILED after {max_attempts} attempts.")
+    print("   Orphaned resources remain. Inspect the cloud console and run")
+    print("   the shell preflight orphan-cleanup path on the next create.")
+    return False
